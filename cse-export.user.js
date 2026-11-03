@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CSE Export
 // @namespace    https://github.com/marcbuholzer-cpu/componentsearchengine.com
-// @version      1.0.0
+// @version      1.1.0
 // @description  Exportiert Suchergebnisse von componentsearchengine.com zeilenweise oder über mehrere Seiten (CSV/JSON).
 // @match        https://componentsearchengine.com/*
 // @match        https://www.componentsearchengine.com/*
@@ -18,9 +18,11 @@
   var DEFAULT_SELECTOR = 'table tbody tr, table tr';
   var DEFAULT_MAX_PAGES = 20;
   var MARK = 'data-cse-export';
-  var NEXT_RE = /^(?:(?:next|weiter|nächste)(?: page| seite)?\s*[›»>→]{0,2}|[›»>→]{1,2})$/i;
+  var NEXT_RE = /^(?:(?:next|weiter|nächste)(?: page| seite)?\s*[›»>→]{0,2}|[›>])$/i;
+  var NEXT_WEAK_RE = /^(?:»|>>|→)$/;
   var FRAME_TIMEOUT_MS = 20000;
   var FRAME_SETTLE_MS = 800;
+  var NEXT_WAIT_MS = 3000;
 
   function load(key, def) {
     try { return localStorage.getItem(key) || def; } catch (e) { return def; }
@@ -153,19 +155,23 @@
     var sel = getNextSelector();
     if (sel) { try { el = doc.querySelector(sel); } catch (e) { el = null; } }
     if (!el) el = doc.querySelector('a[rel~="next"][href], link[rel~="next"][href]');
-    if (!el) {
+    [NEXT_RE, NEXT_WEAK_RE].forEach(function (re) {
+      if (el) return;
       el = Array.prototype.find.call(doc.querySelectorAll('a[href]'), function (a) {
-        return NEXT_RE.test(clean(a.textContent)) ||
-          NEXT_RE.test(clean(a.getAttribute('aria-label'))) ||
-          NEXT_RE.test(clean(a.getAttribute('title')));
+        return re.test(clean(a.textContent)) ||
+          re.test(clean(a.getAttribute('aria-label'))) ||
+          re.test(clean(a.getAttribute('title')));
       });
-    }
+    });
     if (!el) return null;
     var h = el.getAttribute('href');
     if (!h || /^(#|javascript:)/i.test(h)) return null;
     if (el.closest && el.closest('.disabled, [aria-disabled="true"]')) return null;
     var u = new URL(h, doc.baseURI);
-    return u.origin === location.origin ? u.href : null;
+    if (u.origin !== location.origin) return null;
+    // A link to the page itself (e.g. "»" on the last page) is not a next page.
+    if (u.href === new URL(doc.baseURI).href) return null;
+    return u.href;
   }
 
   // Loads a page in a hidden iframe so JS-rendered results are included.
@@ -226,7 +232,9 @@
           if (doc.readyState === 'loading') return;
           var count = findRows(doc).length;
           if (count !== lastCount) { lastCount = count; stableSince = Date.now(); return; }
-          var settled = count > 0 && Date.now() - stableSince >= FRAME_SETTLE_MS;
+          var stableFor = Date.now() - stableSince;
+          var settled = count > 0 && stableFor >= FRAME_SETTLE_MS &&
+            (findNextUrl(doc) || stableFor >= NEXT_WAIT_MS);
           if (settled || Date.now() - started > FRAME_TIMEOUT_MS) settle();
         }, 200);
       });
@@ -265,13 +273,14 @@
       rows: rows,
       pages: 1,
       visited: new Set([location.href]),
-      next: findNextUrl(document),
+      next: null,
       current: null,
       loader: null,
       stop: false,
       note: '',
-      log: [{ page: 1, count: rows.length, url: location.href }],
+      log: [{ page: 1, count: rows.length, url: location.href, next: findNextUrl(document) }],
     };
+    job.next = job.log[0].next;
     runJob();
   }
 
@@ -285,7 +294,11 @@
     var pagesThisRun = 0;
     try {
       while (job.next && !job.stop) {
-        if (job.visited.has(job.next)) { job.next = null; break; }
+        if (job.visited.has(job.next)) {
+          job.note = 'Weiter-Link zeigt auf eine bereits exportierte Seite (' + job.next + '). Diagnose kopieren und Selektor prüfen.';
+          job.next = null;
+          break;
+        }
         if (pagesThisRun >= max) { job.note = 'Limit von ' + max + ' Seiten pro Lauf erreicht.'; break; }
         var url = job.next;
         job.current = url;
@@ -313,8 +326,8 @@
           var pageNo = job.pages + 1;
           rows.forEach(function (r) { var o = extract(r); o.Seite = pageNo; job.rows.push(o); });
           job.pages = pageNo;
-          job.log.push({ page: pageNo, count: rows.length, url: url });
           job.next = findNextUrl(loaded.doc);
+          job.log.push({ page: pageNo, count: rows.length, url: url, next: job.next });
         } finally {
           loaded.dispose();
         }
@@ -322,6 +335,9 @@
         renderJob();
       }
       job.state = job.next ? 'paused' : 'done';
+      if (job.state === 'done' && !job.note) {
+        job.note = 'Kein Weiter-Link auf Seite ' + job.pages + ' gefunden. Falls es weitere Seiten gibt: Diagnose kopieren.';
+      }
       if (job.stop) job.note = 'Gestoppt. Weiter setzt ab Seite ' + (job.pages + 1) + ' fort.';
       downloadJob();
     } catch (e) {
@@ -366,6 +382,46 @@
     return f ? f.value : 'csv';
   }
 
+  function shortUrl(u) {
+    try { var x = new URL(u); return x.pathname + x.search; } catch (e) { return u; }
+  }
+
+  // Collects what is needed to tune the selectors for the real site.
+  function diagnostics() {
+    var out = ['URL: ' + location.href, 'Zeilen-Selektor: ' + getSelector(),
+      'Weiter-Link-Selektor: ' + (getNextSelector() || 'automatisch'),
+      'Zeilen gefunden: ' + findRows().length, 'Erkannter Weiter-Link: ' + (findNextUrl(document) || 'keiner')];
+    if (job) {
+      out.push('Job: ' + job.state + ', ' + job.note);
+      job.log.forEach(function (it) { out.push('  Seite ' + it.page + ': ' + it.count + ' Zeilen, ' + it.url + ' -> ' + (it.next || 'kein Link')); });
+    }
+    out.push('', 'Links, die nach Seitennavigation aussehen:');
+    var containers = new Set();
+    Array.prototype.forEach.call(document.querySelectorAll('a, button'), function (a) {
+      if (a.closest('#cse-panel')) return;
+      var t = clean(a.textContent);
+      var h = a.getAttribute('href') || '';
+      if (/^\d{1,4}$|^[‹›«»<>→←]+$|next|weiter|prev|zurück|nächste/i.test(t) || /page|offset|start=|skip/i.test(h)) {
+        out.push('  <' + a.tagName.toLowerCase() + '> "' + t + '" href=' + h + ' class=' + (a.className || '') +
+          ' rel=' + (a.getAttribute('rel') || '') + ' aria-label=' + (a.getAttribute('aria-label') || ''));
+        var c = a.closest('nav, ul, ol, .pagination, [class*=pag]');
+        if (c) containers.add(c);
+      }
+    });
+    containers.forEach(function (c) { out.push('', 'HTML der Navigation:', c.outerHTML.slice(0, 3000)); });
+    return out.join('\n');
+  }
+
+  function copyDiagnostics() {
+    var text = diagnostics();
+    var done = function () { setText('cse-job-note', 'Diagnose in die Zwischenablage kopiert.'); };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done, function () { download('cse_diagnose.txt', text, 'text/plain'); });
+    } else {
+      download('cse_diagnose.txt', text, 'text/plain');
+    }
+  }
+
   function renderJob() {
     var s = job ? job.state : 'idle';
     setText('cse-job-state', job ? STATE_LABEL[s] : 'kein Job');
@@ -393,7 +449,7 @@
         a.rel = 'noopener';
         a.textContent = 'Seite ' + it.page;
         li.appendChild(a);
-        li.appendChild(document.createTextNode(': ' + it.count + ' Zeilen'));
+        li.appendChild(document.createTextNode(': ' + it.count + ' Zeilen, weiter: ' + (it.next ? shortUrl(it.next) : 'kein Link')));
         log.appendChild(li);
       });
       log.scrollTop = log.scrollHeight;
@@ -491,7 +547,8 @@
       '<button type="button" id="cse-stop" class="cse-stop" title="Anhalten und aktuellen Stand herunterladen">Stop</button>' +
       '<button type="button" id="cse-resume" class="cse-resume">Weiter</button></div>' +
       '<div class="cse-row"><button type="button" id="cse-download" class="cse-ghost">Download</button>' +
-      '<button type="button" id="cse-reset" class="cse-ghost">Neu</button></div>' +
+      '<button type="button" id="cse-reset" class="cse-ghost">Neu</button>' +
+      '<button type="button" id="cse-diag" class="cse-ghost" title="Infos zur Seitennavigation kopieren">Diagnose kopieren</button></div>' +
       '<dl><dt>Status</dt><dd id="cse-job-state">kein Job</dd>' +
       '<dt>Seiten</dt><dd id="cse-job-pages">0</dd>' +
       '<dt>Zeilen</dt><dd id="cse-job-rows">0</dd></dl>' +
@@ -530,6 +587,7 @@
     $('cse-resume').addEventListener('click', runJob);
     $('cse-download').addEventListener('click', downloadJob);
     $('cse-reset').addEventListener('click', resetJob);
+    $('cse-diag').addEventListener('click', copyDiagnostics);
 
     window.addEventListener('beforeunload', function (e) {
       if (job && job.state === 'running') { e.preventDefault(); e.returnValue = ''; }

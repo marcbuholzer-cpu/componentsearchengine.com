@@ -25,9 +25,12 @@ der echten Seite, die Cloudflare-Sicherheitsprüfung bestehst du also ganz norma
 | Weiter     | Setzt ab der nächsten noch nicht exportierten Seite fort. |
 | Download   | Lädt den aktuellen Stand erneut herunter (Format umschaltbar). |
 | Neu        | Verwirft den Job. |
+| Diagnose kopieren | Kopiert erkannte Weiter-Links und das HTML der Seitennavigation in die Zwischenablage (zur Fehlersuche). |
 
 * Angezeigt werden Status (läuft, pausiert, fertig), Anzahl Seiten und Zeilen
-  sowie ein Log pro Seite.
+  sowie ein Log pro Seite mit dem jeweils erkannten Weiter-Link.
+* Endet der Job früher als erwartet, steht im Hinweis der Grund (kein Weiter-Link
+  oder Link auf eine bereits exportierte Seite).
 * "Max. Seiten pro Lauf" (Default 20): danach pausiert der Job, lädt den Stand
   herunter, und "Weiter" setzt fort. Gleiches bei Ladefehlern.
 * Liefert eine Seite keine Zeilen (z. B. erneute Sicherheitsprüfung), pausiert der
