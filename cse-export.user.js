@@ -1,14 +1,20 @@
+// ==UserScript==
+// @name         CSE Export
+// @namespace    https://github.com/marcbuholzer-cpu/componentsearchengine.com
+// @version      1.0.0
+// @description  Exportiert Suchergebnisse von componentsearchengine.com zeilenweise oder über mehrere Seiten (CSV/JSON).
+// @match        https://componentsearchengine.com/*
+// @match        https://www.componentsearchengine.com/*
+// @grant        none
+// @run-at       document-idle
+// @noframes
+// ==/UserScript==
+
 (function () {
   'use strict';
   if (window.__cseExport) return;
   window.__cseExport = true;
 
-  var FRAME_NAME = 'cse-export-frame';
-  // Pages loaded for multi-page export only need to render, not get their own UI.
-  if (window.name === FRAME_NAME) return;
-
-  var script = document.currentScript || document.querySelector('script[data-upstream]');
-  var UPSTREAM = (script && script.getAttribute('data-upstream')) || location.origin;
   var DEFAULT_SELECTOR = 'table tbody tr, table tr';
   var DEFAULT_MAX_PAGES = 20;
   var MARK = 'data-cse-export';
@@ -29,13 +35,8 @@
     return n > 0 ? n : DEFAULT_MAX_PAGES;
   }
 
-  // Proxied links point at the proxy; exported links should point at the real site.
-  function toUpstream(href, base) {
-    try {
-      var u = new URL(href, base || location.href);
-      if (u.origin === location.origin) return UPSTREAM + u.pathname + u.search + u.hash;
-      return u.href;
-    } catch (e) { return href; }
+  function absUrl(href, base) {
+    try { return new URL(href, base || location.href).href; } catch (e) { return href; }
   }
 
   function clean(s) { return (s || '').replace(/\s+/g, ' ').trim(); }
@@ -83,7 +84,7 @@
       if (a.closest('[' + MARK + ']')) return;
       var h = a.getAttribute('href');
       if (!h || /^(javascript:|#)/i.test(h)) return;
-      var u = toUpstream(h, base);
+      var u = absUrl(h, base);
       if (links.indexOf(u) === -1) links.push(u);
     });
     var headers = headersFor(row, values.length);
@@ -167,35 +168,62 @@
     return u.origin === location.origin ? u.href : null;
   }
 
-  // Loads a page in a hidden same-origin iframe so JS-rendered results are included.
+  // Loads a page in a hidden iframe so JS-rendered results are included.
+  // Falls back to fetch + DOMParser when the site forbids framing or the frame shows no rows.
   // Returns { promise, cancel }; cancel() aborts the load and rejects the promise.
+  var frameBlocked = false;
+
   function loadPage(url) {
-    var frame = document.createElement('iframe');
-    var timer = null;
-    var settle;
-    var promise = new Promise(function (resolve, reject) {
+    var cancelled = false;
+    var current = null;
+
+    var promise = (frameBlocked ? Promise.resolve(null) : loadInFrame(url, function (c) { current = c; }))
+      .catch(function (e) {
+        if (cancelled) throw e;
+        frameBlocked = true;
+        return null;
+      })
+      .then(function (res) {
+        if (cancelled) { if (res) res.dispose(); throw new Error('abgebrochen'); }
+        if (res && findRows(res.doc).length) return res;
+        if (res) res.dispose();
+        return loadViaFetch(url, function (c) { current = c; });
+      });
+
+    return {
+      promise: promise,
+      cancel: function () { cancelled = true; if (current) current(); },
+    };
+  }
+
+  function loadInFrame(url, onCancel) {
+    return new Promise(function (resolve, reject) {
+      var frame = document.createElement('iframe');
+      var timer = null;
       var started = Date.now();
       var lastCount = -1;
       var stableSince = 0;
       var done = false;
 
-      settle = function (err) {
+      function settle(err) {
         if (done) return;
         done = true;
         clearInterval(timer);
         if (err) { frame.remove(); reject(err); return; }
         resolve({ doc: frame.contentDocument, dispose: function () { frame.remove(); } });
-      };
+      }
+      onCancel(function () { settle(new Error('abgebrochen')); });
 
-      frame.name = FRAME_NAME;
       frame.setAttribute(MARK, '');
       frame.style.cssText = 'position:fixed;left:-10000px;top:0;width:1280px;height:900px;visibility:hidden';
       frame.addEventListener('load', function () {
         clearInterval(timer);
         timer = setInterval(function () {
           var doc;
-          try { doc = frame.contentDocument; } catch (e) { settle(new Error('Kein Zugriff auf ' + url)); return; }
-          if (!doc || doc.readyState === 'loading') return;
+          try { doc = frame.contentDocument; } catch (e) { doc = null; }
+          // Blocked frames (X-Frame-Options/CSP) end up cross-origin or on about:blank.
+          if (!doc || doc.URL === 'about:blank') { settle(new Error('iframe blockiert')); return; }
+          if (doc.readyState === 'loading') return;
           var count = findRows(doc).length;
           if (count !== lastCount) { lastCount = count; stableSince = Date.now(); return; }
           var settled = count > 0 && Date.now() - stableSince >= FRAME_SETTLE_MS;
@@ -205,7 +233,25 @@
       frame.src = url;
       document.body.appendChild(frame);
     });
-    return { promise: promise, cancel: function () { settle(new Error('abgebrochen')); } };
+  }
+
+  function loadViaFetch(url, onCancel) {
+    var ctrl = new AbortController();
+    onCancel(function () { ctrl.abort(); });
+    return fetch(url, { credentials: 'include', signal: ctrl.signal })
+      .catch(function (e) { throw new Error(e.name === 'AbortError' ? 'abgebrochen' : 'Netzwerkfehler'); })
+      .then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.text();
+      })
+      .then(function (html) {
+        var doc = new DOMParser().parseFromString(html, 'text/html');
+        // Relative links must resolve against the fetched page, not the current one.
+        var base = doc.createElement('base');
+        base.href = url;
+        doc.head.insertBefore(base, doc.head.firstChild);
+        return { doc: doc, dispose: function () {} };
+      });
   }
 
   // job.state: 'running' | 'paused' | 'done'
@@ -257,12 +303,13 @@
         try {
           if (job.stop) break;
           var rows = findRows(loaded.doc);
-          job.visited.add(url);
           if (!rows.length) {
-            job.note = 'Seite ohne Zeilen, Export beendet.';
-            job.next = null;
+            // Could be a security check or a page that failed to render: pause, keep next.
+            job.note = 'Seite ' + (job.pages + 1) + ' ohne Zeilen (evtl. Sicherheitsprüfung). ' +
+              'Seite im Tab öffnen, Prüfung bestehen, dann Weiter.';
             break;
           }
+          job.visited.add(url);
           var pageNo = job.pages + 1;
           rows.forEach(function (r) { var o = extract(r); o.Seite = pageNo; job.rows.push(o); });
           job.pages = pageNo;
