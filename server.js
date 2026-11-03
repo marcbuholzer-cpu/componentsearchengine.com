@@ -6,7 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
 
-const PORT = Number(process.env.PORT) || 3000;
+const PORT = Number(process.env.PORT) || 3030;
 const UPSTREAM = new URL(process.env.UPSTREAM || 'https://componentsearchengine.com');
 const START_PATH = process.env.START_PATH || '/search?term=schurter';
 const EXPORT_PREFIX = '/__export/';

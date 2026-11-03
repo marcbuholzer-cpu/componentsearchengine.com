@@ -1,7 +1,8 @@
 # CSE Export Proxy
 
 Reverse Proxy für componentsearchengine.com. Jede Ergebniszeile bekommt einen
-"Export"-Button (CSV), unten rechts gibt es "Alle als CSV" und "Alle als JSON".
+"Export"-Button (CSV). Die Leiste unten rechts exportiert die aktuelle Seite
+oder alle Ergebnisseiten auf einmal (CSV oder JSON).
 
 ## Start
 
@@ -11,13 +12,13 @@ Node 18 oder neuer, keine Abhängigkeiten.
 npm start
 ```
 
-Dann öffnen: http://localhost:3000/search?term=schurter (oder http://localhost:3000/__start)
+Dann öffnen: http://localhost:3030/search?term=schurter (oder http://localhost:3030/__start)
 
 ## Konfiguration (Umgebungsvariablen)
 
 | Variable     | Default                             |
 |--------------|-------------------------------------|
-| `PORT`       | `3000`                              |
+| `PORT`       | `3030`                              |
 | `UPSTREAM`   | `https://componentsearchengine.com` |
 | `START_PATH` | `/search?term=schurter`             |
 
@@ -30,7 +31,19 @@ Dann öffnen: http://localhost:3000/search?term=schurter (oder http://localhost:
   Falls die Seite keine Tabelle nutzt, Selektor im Eingabefeld der Toolbar
   anpassen (wird im Browser gespeichert).
 * Per JavaScript nachgeladene Zeilen werden automatisch erkannt.
-* Exportiert wird, was auf der aktuellen Seite angezeigt ist (bei Pagination pro Seite).
+
+## Mehrere Seiten
+
+"Alle Seiten CSV/JSON" startet auf der aktuellen Seite und folgt dem Link zur
+nächsten Seite, bis keiner mehr da ist oder "Max. Seiten" (Default 20) erreicht ist.
+Das Ergebnis ist eine Datei mit zusätzlicher Spalte `Seite`.
+
+* Der Weiter-Link wird automatisch erkannt (`rel="next"` oder Linktext wie
+  "Next", "Weiter", "Nächste Seite", "›", "»"). Falls das nicht greift, im Feld
+  "Weiter-Link" einen CSS-Selektor eintragen, z. B. `.pagination a.next`.
+* Jede Seite wird über den Proxy in einem unsichtbaren iframe geladen, damit auch
+  per JavaScript gerenderte Ergebnisse erfasst werden.
+* Seiten, die nur per JavaScript-Button ohne echten Link blättern, werden nicht unterstützt.
 
 ## Funktionsweise
 
