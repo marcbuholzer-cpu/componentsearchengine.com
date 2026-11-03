@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CSE Export
 // @namespace    https://github.com/marcbuholzer-cpu/componentsearchengine.com
-// @version      1.2.0
+// @version      1.3.0
 // @description  Exportiert Suchergebnisse von componentsearchengine.com zeilenweise oder über mehrere Seiten (CSV/JSON).
 // @match        https://componentsearchengine.com/*
 // @match        https://www.componentsearchengine.com/*
@@ -41,6 +41,30 @@
 
   function clean(s) { return (s || '').replace(/\s+/g, ' ').trim(); }
 
+  // Text of a cell independent of rendering: innerText drops content the site hides
+  // at the current width (the panel makes the page narrower). Icon-only cells fall
+  // back to alt/title/aria-label.
+  var SKIP_TAGS = { SCRIPT: 1, STYLE: 1, NOSCRIPT: 1, TEMPLATE: 1 };
+  function cellText(el) {
+    var parts = [];
+    (function walk(n) {
+      for (var c = n.firstChild; c; c = c.nextSibling) {
+        if (c.nodeType === 3) parts.push(c.nodeValue);
+        else if (c.nodeType === 1 && !SKIP_TAGS[c.tagName] && !c.hasAttribute(MARK)) { walk(c); parts.push(' '); }
+      }
+    })(el);
+    var text = clean(parts.join(''));
+    if (text) return text;
+    var attrs = [];
+    Array.prototype.forEach.call(el.querySelectorAll('[alt], [title], [aria-label]'), function (n) {
+      ['alt', 'title', 'aria-label'].forEach(function (a) {
+        var v = clean(n.getAttribute(a));
+        if (v && attrs.indexOf(v) === -1) attrs.push(v);
+      });
+    });
+    return attrs.join(' ');
+  }
+
   function dataCells(row) {
     var cells = row.cells ? Array.prototype.slice.call(row.cells) : Array.prototype.slice.call(row.children);
     return cells.filter(function (c) { return !c.hasAttribute(MARK); });
@@ -69,7 +93,7 @@
     if (table) {
       var headRow = table.querySelector('thead tr') ||
         Array.prototype.find.call(table.rows, function (r) { return !r.querySelector('td') && r.querySelector('th'); });
-      if (headRow) names = dataCells(headRow).map(function (c) { return clean(c.innerText || c.textContent); });
+      if (headRow) names = dataCells(headRow).map(cellText);
     }
     for (var i = 0; i < width; i++) if (!names[i]) names[i] = 'Spalte ' + (i + 1);
     return names.slice(0, width);
@@ -78,7 +102,7 @@
   function extract(row) {
     var base = row.ownerDocument.baseURI;
     var cells = dataCells(row);
-    var values = cells.map(function (c) { return clean(c.innerText || c.textContent); });
+    var values = cells.map(cellText);
     var links = [];
     Array.prototype.forEach.call(row.querySelectorAll('a[href]'), function (a) {
       if (a.closest('[' + MARK + ']')) return;
@@ -272,20 +296,21 @@
 
   function startJob() {
     if (job && job.state === 'running') return;
+    // The start page is loaded like every other page (hidden, full width) instead of
+    // reading the visible page, so all pages are exported the same way.
     var first = currentPageNo();
-    var rowEls = findRows();
     job = {
       state: 'paused',
-      rows: rowEls.map(function (r) { var o = extract(r); o.Seite = first; return o; }),
+      rows: [],
       firstPage: first,
-      page: first,
-      lastKnown: maxPageIn(document),
-      prevSig: rowSignature(rowEls),
+      page: first - 1,
+      lastKnown: 0,
+      prevSig: null,
       current: null,
       loader: null,
       stop: false,
       note: '',
-      log: [{ page: first, count: rowEls.length, url: location.href }],
+      log: [],
     };
     runJob();
   }
@@ -304,7 +329,7 @@
         var n = job.page + 1;
         if (job.lastKnown && n > job.lastKnown) { finished = true; break; }
         if (pagesThisRun >= max) { job.note = 'Limit von ' + max + ' Seiten pro Lauf erreicht.'; break; }
-        var url = pageUrl(n);
+        var url = n === job.firstPage ? location.href : pageUrl(n);
         job.current = url;
         renderJob();
         job.loader = loadPage(url);
@@ -394,6 +419,14 @@
       'Seiten-Parameter: ' + getPageParam(), 'Aktuelle Seite: ' + currentPageNo(),
       'Höchste verlinkte Seite: ' + (maxPageIn(document) || 'keine gefunden'),
       'Zeilen gefunden: ' + findRows().length];
+    var first = findRows()[0];
+    if (first) {
+      var table = first.closest('table');
+      var head = table && (table.querySelector('thead tr') || table.rows[0]);
+      if (head) out.push('', 'HTML der Kopfzeile:', head.outerHTML.slice(0, 3000));
+      out.push('', 'HTML der ersten Zeile:', first.outerHTML.slice(0, 3000));
+      out.push('', 'Export der ersten Zeile:', JSON.stringify(extract(first)));
+    }
     if (job) {
       out.push('Job: ' + job.state + ', ' + job.note);
       job.log.forEach(function (it) { out.push('  Seite ' + it.page + ': ' + it.count + ' Zeilen, ' + it.url); });
@@ -429,7 +462,7 @@
     var s = job ? job.state : 'idle';
     setText('cse-job-state', job ? STATE_LABEL[s] : 'kein Job');
     $('cse-job-state').setAttribute('data-state', s);
-    setText('cse-job-pages', job ? job.firstPage + ' bis ' + job.page : '0');
+    setText('cse-job-pages', job && job.page >= job.firstPage ? job.firstPage + ' bis ' + job.page : '0');
     setText('cse-job-last', job && job.lastKnown ? String(job.lastKnown) : 'unbekannt');
     setText('cse-job-rows', job ? String(job.rows.length) : '0');
     setText('cse-job-current', job && job.current ? 'Lade Seite ' + (job.page + 1) + ' …' : '');

@@ -20,7 +20,7 @@ der echten Seite, die Cloudflare-Sicherheitsprüfung bestehst du also ganz norma
 
 | Button     | Wirkung |
 |------------|---------|
-| Start      | Startet auf der aktuellen Seite und lädt danach `page=2`, `page=3` usw. |
+| Start      | Lädt die aktuelle Seite und danach `page=2`, `page=3` usw. Alle Seiten werden gleich behandelt (unsichtbar in voller Breite geladen). |
 | Stop       | Hält sofort an und lädt den bisherigen Stand herunter. |
 | Weiter     | Setzt ab der nächsten noch nicht exportierten Seite fort. |
 | Download   | Lädt den aktuellen Stand erneut herunter (Format umschaltbar). |
@@ -50,6 +50,10 @@ der echten Seite, die Cloudflare-Sicherheitsprüfung bestehst du also ganz norma
 
 * CSV mit `;` als Trenner und UTF-8 BOM (öffnet direkt korrekt in Excel DE/CH).
 * Spaltennamen aus dem Tabellenkopf, zusätzlich Spalte `Links` mit allen Links der Zeile.
+* Texte werden unabhängig von der Darstellung gelesen (auch ausgeblendete Inhalte).
+  Zellen nur mit Icon oder Bild liefern `alt`, `title` bzw. `aria-label`.
+* "Seite CSV/JSON" und die Zeilen-Buttons lesen die sichtbare Seite. Fehlen dort
+  Spalten, weil das Panel die Seite schmaler macht: Panel einklappen oder den Export-Job nutzen.
 
 ## Einstellungen im Panel
 
