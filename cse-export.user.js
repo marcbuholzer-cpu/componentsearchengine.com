@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CSE Export
 // @namespace    https://github.com/marcbuholzer-cpu/componentsearchengine.com
-// @version      1.1.0
+// @version      1.2.0
 // @description  Exportiert Suchergebnisse von componentsearchengine.com zeilenweise oder über mehrere Seiten (CSV/JSON).
 // @match        https://componentsearchengine.com/*
 // @match        https://www.componentsearchengine.com/*
@@ -18,11 +18,9 @@
   var DEFAULT_SELECTOR = 'table tbody tr, table tr';
   var DEFAULT_MAX_PAGES = 20;
   var MARK = 'data-cse-export';
-  var NEXT_RE = /^(?:(?:next|weiter|nächste)(?: page| seite)?\s*[›»>→]{0,2}|[›>])$/i;
-  var NEXT_WEAK_RE = /^(?:»|>>|→)$/;
   var FRAME_TIMEOUT_MS = 20000;
   var FRAME_SETTLE_MS = 800;
-  var NEXT_WAIT_MS = 3000;
+  var PAGINATION_WAIT_MS = 3000;
 
   function load(key, def) {
     try { return localStorage.getItem(key) || def; } catch (e) { return def; }
@@ -31,7 +29,7 @@
     try { localStorage.setItem(key, v); } catch (e) { /* ignore */ }
   }
   function getSelector() { return load('cseExportSelector', DEFAULT_SELECTOR); }
-  function getNextSelector() { return load('cseExportNext', ''); }
+  function getPageParam() { return load('cseExportPageParam', 'page'); }
   function getMaxPages() {
     var n = parseInt(load('cseExportMaxPages', ''), 10);
     return n > 0 ? n : DEFAULT_MAX_PAGES;
@@ -150,28 +148,35 @@
 
   // ---- Multi-page export ----
 
-  function findNextUrl(doc) {
-    var el = null;
-    var sel = getNextSelector();
-    if (sel) { try { el = doc.querySelector(sel); } catch (e) { el = null; } }
-    if (!el) el = doc.querySelector('a[rel~="next"][href], link[rel~="next"][href]');
-    [NEXT_RE, NEXT_WEAK_RE].forEach(function (re) {
-      if (el) return;
-      el = Array.prototype.find.call(doc.querySelectorAll('a[href]'), function (a) {
-        return re.test(clean(a.textContent)) ||
-          re.test(clean(a.getAttribute('aria-label'))) ||
-          re.test(clean(a.getAttribute('title')));
-      });
-    });
-    if (!el) return null;
-    var h = el.getAttribute('href');
-    if (!h || /^(#|javascript:)/i.test(h)) return null;
-    if (el.closest && el.closest('.disabled, [aria-disabled="true"]')) return null;
-    var u = new URL(h, doc.baseURI);
-    if (u.origin !== location.origin) return null;
-    // A link to the page itself (e.g. "»" on the last page) is not a next page.
-    if (u.href === new URL(doc.baseURI).href) return null;
+  function pageUrl(n) {
+    var u = new URL(location.href);
+    u.searchParams.set(getPageParam(), String(n));
     return u.href;
+  }
+
+  function currentPageNo() {
+    var n = parseInt(new URL(location.href).searchParams.get(getPageParam()), 10);
+    return n > 0 ? n : 1;
+  }
+
+  // Highest page number linked from the document's pagination (0 if none).
+  function maxPageIn(doc) {
+    var param = getPageParam();
+    var max = 0;
+    Array.prototype.forEach.call(doc.querySelectorAll('a[href]'), function (a) {
+      if (a.closest('#cse-panel')) return;
+      try {
+        var u = new URL(a.getAttribute('href'), doc.baseURI);
+        if (u.origin !== location.origin || u.pathname !== location.pathname) return;
+        var n = parseInt(u.searchParams.get(param), 10);
+        if (n > max) max = n;
+      } catch (e) { /* ignore */ }
+    });
+    return max;
+  }
+
+  function rowSignature(rows) {
+    return rows.length + '|' + rows.map(function (r) { return clean(r.textContent); }).join('|');
   }
 
   // Loads a page in a hidden iframe so JS-rendered results are included.
@@ -234,7 +239,7 @@
           if (count !== lastCount) { lastCount = count; stableSince = Date.now(); return; }
           var stableFor = Date.now() - stableSince;
           var settled = count > 0 && stableFor >= FRAME_SETTLE_MS &&
-            (findNextUrl(doc) || stableFor >= NEXT_WAIT_MS);
+            (maxPageIn(doc) > 0 || stableFor >= PAGINATION_WAIT_MS);
           if (settled || Date.now() - started > FRAME_TIMEOUT_MS) settle();
         }, 200);
       });
@@ -267,20 +272,21 @@
 
   function startJob() {
     if (job && job.state === 'running') return;
-    var rows = findRows().map(function (r) { var o = extract(r); o.Seite = 1; return o; });
+    var first = currentPageNo();
+    var rowEls = findRows();
     job = {
       state: 'paused',
-      rows: rows,
-      pages: 1,
-      visited: new Set([location.href]),
-      next: null,
+      rows: rowEls.map(function (r) { var o = extract(r); o.Seite = first; return o; }),
+      firstPage: first,
+      page: first,
+      lastKnown: maxPageIn(document),
+      prevSig: rowSignature(rowEls),
       current: null,
       loader: null,
       stop: false,
       note: '',
-      log: [{ page: 1, count: rows.length, url: location.href, next: findNextUrl(document) }],
+      log: [{ page: first, count: rowEls.length, url: location.href }],
     };
-    job.next = job.log[0].next;
     runJob();
   }
 
@@ -292,15 +298,13 @@
     renderJob();
     var max = getMaxPages();
     var pagesThisRun = 0;
+    var finished = false;
     try {
-      while (job.next && !job.stop) {
-        if (job.visited.has(job.next)) {
-          job.note = 'Weiter-Link zeigt auf eine bereits exportierte Seite (' + job.next + '). Diagnose kopieren und Selektor prüfen.';
-          job.next = null;
-          break;
-        }
+      while (!job.stop) {
+        var n = job.page + 1;
+        if (job.lastKnown && n > job.lastKnown) { finished = true; break; }
         if (pagesThisRun >= max) { job.note = 'Limit von ' + max + ' Seiten pro Lauf erreicht.'; break; }
-        var url = job.next;
+        var url = pageUrl(n);
         job.current = url;
         renderJob();
         job.loader = loadPage(url);
@@ -315,30 +319,32 @@
         }
         try {
           if (job.stop) break;
-          var rows = findRows(loaded.doc);
-          if (!rows.length) {
-            // Could be a security check or a page that failed to render: pause, keep next.
-            job.note = 'Seite ' + (job.pages + 1) + ' ohne Zeilen (evtl. Sicherheitsprüfung). ' +
+          var rowEls = findRows(loaded.doc);
+          if (!rowEls.length) {
+            // End of results or a security check: pause so Weiter can retry.
+            job.note = 'Seite ' + n + ' ohne Zeilen. Falls das nicht das Ende ist (z. B. Sicherheitsprüfung): ' +
               'Seite im Tab öffnen, Prüfung bestehen, dann Weiter.';
             break;
           }
-          job.visited.add(url);
-          var pageNo = job.pages + 1;
-          rows.forEach(function (r) { var o = extract(r); o.Seite = pageNo; job.rows.push(o); });
-          job.pages = pageNo;
-          job.next = findNextUrl(loaded.doc);
-          job.log.push({ page: pageNo, count: rows.length, url: url, next: job.next });
+          var sig = rowSignature(rowEls);
+          if (sig === job.prevSig) {
+            job.note = 'Seite ' + n + ' wiederholt die vorherige Seite, Ende erreicht.';
+            finished = true;
+            break;
+          }
+          rowEls.forEach(function (r) { var o = extract(r); o.Seite = n; job.rows.push(o); });
+          job.page = n;
+          job.prevSig = sig;
+          job.lastKnown = Math.max(job.lastKnown, maxPageIn(loaded.doc));
+          job.log.push({ page: n, count: rowEls.length, url: url });
         } finally {
           loaded.dispose();
         }
         pagesThisRun++;
         renderJob();
       }
-      job.state = job.next ? 'paused' : 'done';
-      if (job.state === 'done' && !job.note) {
-        job.note = 'Kein Weiter-Link auf Seite ' + job.pages + ' gefunden. Falls es weitere Seiten gibt: Diagnose kopieren.';
-      }
-      if (job.stop) job.note = 'Gestoppt. Weiter setzt ab Seite ' + (job.pages + 1) + ' fort.';
+      job.state = finished && !job.stop ? 'done' : 'paused';
+      if (job.stop) job.note = 'Gestoppt. Weiter setzt ab Seite ' + (job.page + 1) + ' fort.';
       downloadJob();
     } catch (e) {
       job.state = 'paused';
@@ -357,7 +363,7 @@
 
   function downloadJob() {
     if (!job || !job.rows.length) return;
-    writeFile(job.rows, getFormat(), '_seiten_1-' + job.pages);
+    writeFile(job.rows, getFormat(), '_seiten_' + job.firstPage + '-' + job.page);
   }
 
   function resetJob() {
@@ -382,18 +388,15 @@
     return f ? f.value : 'csv';
   }
 
-  function shortUrl(u) {
-    try { var x = new URL(u); return x.pathname + x.search; } catch (e) { return u; }
-  }
-
   // Collects what is needed to tune the selectors for the real site.
   function diagnostics() {
     var out = ['URL: ' + location.href, 'Zeilen-Selektor: ' + getSelector(),
-      'Weiter-Link-Selektor: ' + (getNextSelector() || 'automatisch'),
-      'Zeilen gefunden: ' + findRows().length, 'Erkannter Weiter-Link: ' + (findNextUrl(document) || 'keiner')];
+      'Seiten-Parameter: ' + getPageParam(), 'Aktuelle Seite: ' + currentPageNo(),
+      'Höchste verlinkte Seite: ' + (maxPageIn(document) || 'keine gefunden'),
+      'Zeilen gefunden: ' + findRows().length];
     if (job) {
       out.push('Job: ' + job.state + ', ' + job.note);
-      job.log.forEach(function (it) { out.push('  Seite ' + it.page + ': ' + it.count + ' Zeilen, ' + it.url + ' -> ' + (it.next || 'kein Link')); });
+      job.log.forEach(function (it) { out.push('  Seite ' + it.page + ': ' + it.count + ' Zeilen, ' + it.url); });
     }
     out.push('', 'Links, die nach Seitennavigation aussehen:');
     var containers = new Set();
@@ -426,9 +429,10 @@
     var s = job ? job.state : 'idle';
     setText('cse-job-state', job ? STATE_LABEL[s] : 'kein Job');
     $('cse-job-state').setAttribute('data-state', s);
-    setText('cse-job-pages', job ? String(job.pages) : '0');
+    setText('cse-job-pages', job ? job.firstPage + ' bis ' + job.page : '0');
+    setText('cse-job-last', job && job.lastKnown ? String(job.lastKnown) : 'unbekannt');
     setText('cse-job-rows', job ? String(job.rows.length) : '0');
-    setText('cse-job-current', job && job.current ? 'Lade Seite ' + (job.pages + 1) + ' …' : '');
+    setText('cse-job-current', job && job.current ? 'Lade Seite ' + (job.page + 1) + ' …' : '');
     setText('cse-job-note', job ? job.note : '');
 
     $('cse-start').disabled = !!job;
@@ -449,7 +453,7 @@
         a.rel = 'noopener';
         a.textContent = 'Seite ' + it.page;
         li.appendChild(a);
-        li.appendChild(document.createTextNode(': ' + it.count + ' Zeilen, weiter: ' + (it.next ? shortUrl(it.next) : 'kein Link')));
+        li.appendChild(document.createTextNode(': ' + it.count + ' Zeilen'));
         log.appendChild(li);
       });
       log.scrollTop = log.scrollHeight;
@@ -551,6 +555,7 @@
       '<button type="button" id="cse-diag" class="cse-ghost" title="Infos zur Seitennavigation kopieren">Diagnose kopieren</button></div>' +
       '<dl><dt>Status</dt><dd id="cse-job-state">kein Job</dd>' +
       '<dt>Seiten</dt><dd id="cse-job-pages">0</dd>' +
+      '<dt>Letzte Seite</dt><dd id="cse-job-last">unbekannt</dd>' +
       '<dt>Zeilen</dt><dd id="cse-job-rows">0</dd></dl>' +
       '<div id="cse-job-current"></div>' +
       '<div id="cse-job-note"></div>' +
@@ -558,7 +563,7 @@
       '<section><h3>Einstellungen</h3>' +
       '<label>Max. Seiten pro Lauf <input id="cse-max" type="number" min="1"></label>' +
       '<label>Zeilen-Selektor <input id="cse-sel"></label>' +
-      '<label>Weiter-Link-Selektor <input id="cse-next" placeholder="automatisch"></label></section>' +
+      '<label>Seiten-Parameter in der URL <input id="cse-param"></label></section>' +
       '</div>';
     document.body.appendChild(panel);
 
@@ -572,9 +577,9 @@
       document.querySelectorAll('[' + MARK + ']:not(iframe)').forEach(function (n) { n.remove(); });
       decorate();
     });
-    var next = $('cse-next');
-    next.value = getNextSelector();
-    next.addEventListener('change', function () { save('cseExportNext', next.value.trim()); });
+    var param = $('cse-param');
+    param.value = getPageParam();
+    param.addEventListener('change', function () { save('cseExportPageParam', param.value.trim() || 'page'); });
     var max = $('cse-max');
     max.value = getMaxPages();
     max.addEventListener('change', function () { save('cseExportMaxPages', String(parseInt(max.value, 10) || DEFAULT_MAX_PAGES)); });
