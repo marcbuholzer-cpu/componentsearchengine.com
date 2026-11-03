@@ -1,8 +1,8 @@
 # CSE Export Proxy
 
 Reverse Proxy für componentsearchengine.com. Jede Ergebniszeile bekommt einen
-"Export"-Button (CSV). Die Leiste unten rechts exportiert die aktuelle Seite
-oder alle Ergebnisseiten auf einmal (CSV oder JSON).
+"Export"-Button (CSV). Das Panel am rechten Rand (einklappbar) exportiert die
+aktuelle Seite oder steuert einen Export-Job über alle Ergebnisseiten (CSV oder JSON).
 
 ## Start
 
@@ -32,15 +32,28 @@ Dann öffnen: http://localhost:3030/search?term=schurter (oder http://localhost:
   anpassen (wird im Browser gespeichert).
 * Per JavaScript nachgeladene Zeilen werden automatisch erkannt.
 
-## Mehrere Seiten
+## Export-Job (mehrere Seiten)
 
-"Alle Seiten CSV/JSON" startet auf der aktuellen Seite und folgt dem Link zur
-nächsten Seite, bis keiner mehr da ist oder "Max. Seiten" (Default 20) erreicht ist.
-Das Ergebnis ist eine Datei mit zusätzlicher Spalte `Seite`.
+Im Panel rechts unter "Export-Job":
 
+| Button     | Wirkung |
+|------------|---------|
+| Start      | Startet auf der aktuellen Seite und folgt dem Link zur nächsten Seite. |
+| Stop       | Hält sofort an und lädt den bisherigen Stand herunter. |
+| Weiter     | Setzt ab der nächsten noch nicht exportierten Seite fort. |
+| Download   | Lädt den aktuellen Stand erneut herunter (Format umschaltbar). |
+| Neu        | Verwirft den Job. |
+
+* Angezeigt werden Status (läuft, pausiert, fertig), Anzahl Seiten und Zeilen
+  sowie ein Log pro Seite.
+* "Max. Seiten pro Lauf" (Default 20): danach pausiert der Job, lädt den Stand
+  herunter, und "Weiter" setzt fort. Gleiches bei Ladefehlern.
+* Am Ende wird die Datei automatisch heruntergeladen. Sie enthält die Spalte `Seite`.
+* Der Job lebt im geöffneten Tab. Neu laden oder wegnavigieren verwirft ihn
+  (während er läuft, fragt der Browser nach).
 * Der Weiter-Link wird automatisch erkannt (`rel="next"` oder Linktext wie
   "Next", "Weiter", "Nächste Seite", "›", "»"). Falls das nicht greift, im Feld
-  "Weiter-Link" einen CSS-Selektor eintragen, z. B. `.pagination a.next`.
+  "Weiter-Link-Selektor" einen CSS-Selektor eintragen, z. B. `.pagination a.next`.
 * Jede Seite wird über den Proxy in einem unsichtbaren iframe geladen, damit auch
   per JavaScript gerenderte Ergebnisse erfasst werden.
 * Seiten, die nur per JavaScript-Button ohne echten Link blättern, werden nicht unterstützt.

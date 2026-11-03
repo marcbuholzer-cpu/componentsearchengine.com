@@ -52,7 +52,7 @@
     var nodes;
     try { nodes = doc.querySelectorAll(getSelector()); } catch (e) { nodes = []; }
     Array.prototype.forEach.call(nodes, function (r) {
-      if (seen.has(r) || r.closest('#cse-export-bar')) return;
+      if (seen.has(r) || r.closest('#cse-panel')) return;
       seen.add(r);
       // Skip pure header rows.
       if (r.tagName === 'TR' && !r.querySelector('td')) return;
@@ -168,89 +168,189 @@
   }
 
   // Loads a page in a hidden same-origin iframe so JS-rendered results are included.
+  // Returns { promise, cancel }; cancel() aborts the load and rejects the promise.
   function loadPage(url) {
-    return new Promise(function (resolve, reject) {
-      var frame = document.createElement('iframe');
-      frame.name = FRAME_NAME;
-      frame.setAttribute(MARK, '');
-      frame.style.cssText = 'position:fixed;left:-10000px;top:0;width:1280px;height:900px;visibility:hidden';
+    var frame = document.createElement('iframe');
+    var timer = null;
+    var settle;
+    var promise = new Promise(function (resolve, reject) {
       var started = Date.now();
       var lastCount = -1;
       var stableSince = 0;
-      var timer = null;
+      var done = false;
 
-      function finish(err) {
+      settle = function (err) {
+        if (done) return;
+        done = true;
         clearInterval(timer);
         if (err) { frame.remove(); reject(err); return; }
         resolve({ doc: frame.contentDocument, dispose: function () { frame.remove(); } });
-      }
+      };
 
+      frame.name = FRAME_NAME;
+      frame.setAttribute(MARK, '');
+      frame.style.cssText = 'position:fixed;left:-10000px;top:0;width:1280px;height:900px;visibility:hidden';
       frame.addEventListener('load', function () {
         clearInterval(timer);
         timer = setInterval(function () {
           var doc;
-          try { doc = frame.contentDocument; } catch (e) { finish(new Error('Kein Zugriff auf ' + url)); return; }
+          try { doc = frame.contentDocument; } catch (e) { settle(new Error('Kein Zugriff auf ' + url)); return; }
           if (!doc || doc.readyState === 'loading') return;
           var count = findRows(doc).length;
           if (count !== lastCount) { lastCount = count; stableSince = Date.now(); return; }
           var settled = count > 0 && Date.now() - stableSince >= FRAME_SETTLE_MS;
-          if (settled || Date.now() - started > FRAME_TIMEOUT_MS) finish();
+          if (settled || Date.now() - started > FRAME_TIMEOUT_MS) settle();
         }, 200);
       });
       frame.src = url;
       document.body.appendChild(frame);
     });
+    return { promise: promise, cancel: function () { settle(new Error('abgebrochen')); } };
   }
 
-  var busy = false;
+  // job.state: 'running' | 'paused' | 'done'
+  var job = null;
 
-  async function exportPages(format) {
-    if (busy) return;
-    busy = true;
-    setBusy(true);
-    var maxPages = getMaxPages();
-    var visited = new Set([location.href]);
-    var all = [];
-    var page = 1;
-    var info = '';
+  function startJob() {
+    if (job && job.state === 'running') return;
+    var rows = findRows().map(function (r) { var o = extract(r); o.Seite = 1; return o; });
+    job = {
+      state: 'paused',
+      rows: rows,
+      pages: 1,
+      visited: new Set([location.href]),
+      next: findNextUrl(document),
+      current: null,
+      loader: null,
+      stop: false,
+      note: '',
+      log: [{ page: 1, count: rows.length, url: location.href }],
+    };
+    runJob();
+  }
+
+  async function runJob() {
+    if (!job || job.state === 'running' || job.state === 'done') return;
+    job.state = 'running';
+    job.stop = false;
+    job.note = '';
+    renderJob();
+    var max = getMaxPages();
+    var pagesThisRun = 0;
     try {
-      findRows().forEach(function (r) { var o = extract(r); o.Seite = page; all.push(o); });
-      var next = findNextUrl(document);
-      while (next && !visited.has(next) && page < maxPages) {
-        visited.add(next);
-        page++;
-        status('Lade Seite ' + page + ' …');
-        var loaded = await loadPage(next);
+      while (job.next && !job.stop) {
+        if (job.visited.has(job.next)) { job.next = null; break; }
+        if (pagesThisRun >= max) { job.note = 'Limit von ' + max + ' Seiten pro Lauf erreicht.'; break; }
+        var url = job.next;
+        job.current = url;
+        renderJob();
+        job.loader = loadPage(url);
+        var loaded;
         try {
+          loaded = await job.loader.promise;
+        } catch (e) {
+          if (job.stop) break;
+          throw e;
+        } finally {
+          job.loader = null;
+        }
+        try {
+          if (job.stop) break;
           var rows = findRows(loaded.doc);
-          if (!rows.length) { info = 'Seite ' + page + ' ohne Zeilen, Abbruch.'; page--; break; }
-          rows.forEach(function (r) { var o = extract(r); o.Seite = page; all.push(o); });
-          next = findNextUrl(loaded.doc);
+          job.visited.add(url);
+          if (!rows.length) {
+            job.note = 'Seite ohne Zeilen, Export beendet.';
+            job.next = null;
+            break;
+          }
+          var pageNo = job.pages + 1;
+          rows.forEach(function (r) { var o = extract(r); o.Seite = pageNo; job.rows.push(o); });
+          job.pages = pageNo;
+          job.log.push({ page: pageNo, count: rows.length, url: url });
+          job.next = findNextUrl(loaded.doc);
         } finally {
           loaded.dispose();
         }
+        pagesThisRun++;
+        renderJob();
       }
-      if (next && page >= maxPages && !visited.has(next)) info = 'Limit von ' + maxPages + ' Seiten erreicht.';
-      if (!all.length) { alert('Keine Zeilen gefunden. Selektor prüfen.'); return; }
-      writeFile(all, format, '_seiten_1-' + page);
-      status(all.length + ' Zeilen aus ' + page + ' Seite(n) exportiert.' + (info ? ' ' + info : ''));
+      job.state = job.next ? 'paused' : 'done';
+      if (job.stop) job.note = 'Gestoppt. Weiter setzt ab Seite ' + (job.pages + 1) + ' fort.';
+      downloadJob();
     } catch (e) {
-      status('Fehler: ' + e.message);
+      job.state = 'paused';
+      job.note = 'Fehler: ' + e.message + '. Weiter versucht es erneut.';
     } finally {
-      busy = false;
-      setBusy(false);
+      job.current = null;
+      renderJob();
     }
+  }
+
+  function stopJob() {
+    if (!job || job.state !== 'running') return;
+    job.stop = true;
+    if (job.loader) job.loader.cancel();
+  }
+
+  function downloadJob() {
+    if (!job || !job.rows.length) return;
+    writeFile(job.rows, getFormat(), '_seiten_1-' + job.pages);
+  }
+
+  function resetJob() {
+    if (job && job.state === 'running') return;
+    job = null;
+    renderJob();
   }
 
   // ---- UI ----
 
-  function status(text) {
-    var el = document.getElementById('cse-export-status');
+  var STATE_LABEL = { running: 'läuft', paused: 'pausiert', done: 'fertig' };
+
+  function $(id) { return document.getElementById(id); }
+
+  function setText(id, text) {
+    var el = $(id);
     if (el && el.textContent !== text) el.textContent = text;
   }
 
-  function setBusy(on) {
-    document.querySelectorAll('#cse-export-bar button').forEach(function (b) { b.disabled = on; });
+  function getFormat() {
+    var f = $('cse-format');
+    return f ? f.value : 'csv';
+  }
+
+  function renderJob() {
+    var s = job ? job.state : 'idle';
+    setText('cse-job-state', job ? STATE_LABEL[s] : 'kein Job');
+    $('cse-job-state').setAttribute('data-state', s);
+    setText('cse-job-pages', job ? String(job.pages) : '0');
+    setText('cse-job-rows', job ? String(job.rows.length) : '0');
+    setText('cse-job-current', job && job.current ? 'Lade Seite ' + (job.pages + 1) + ' …' : '');
+    setText('cse-job-note', job ? job.note : '');
+
+    $('cse-start').disabled = !!job;
+    $('cse-stop').disabled = s !== 'running';
+    $('cse-resume').disabled = s !== 'paused';
+    $('cse-download').disabled = !job || s === 'running' || !job.rows.length;
+    $('cse-reset').disabled = !job || s === 'running';
+
+    var log = $('cse-job-log');
+    var items = job ? job.log : [];
+    if (log.children.length !== items.length) {
+      log.textContent = '';
+      items.forEach(function (it) {
+        var li = document.createElement('li');
+        var a = document.createElement('a');
+        a.href = it.url;
+        a.target = '_blank';
+        a.rel = 'noopener';
+        a.textContent = 'Seite ' + it.page;
+        li.appendChild(a);
+        li.appendChild(document.createTextNode(': ' + it.count + ' Zeilen'));
+        log.appendChild(li);
+      });
+      log.scrollTop = log.scrollHeight;
+    }
   }
 
   function decorate() {
@@ -283,64 +383,117 @@
         head.appendChild(th);
       }
     });
-    var count = document.getElementById('cse-export-count');
-    var label = rows.length + ' Zeilen';
-    if (count && count.textContent !== label) count.textContent = label;
+    setText('cse-page-count', rows.length + ' Zeilen');
   }
 
-  function buildBar() {
+  var PANEL_WIDTH = 300;
+
+  function setCollapsed(on) {
+    document.documentElement.classList.toggle('cse-panel-open', !on);
+    $('cse-panel').classList.toggle('cse-collapsed', on);
+    save('cseExportCollapsed', on ? '1' : '');
+  }
+
+  function buildPanel() {
     var style = document.createElement('style');
     style.textContent =
-      '#cse-export-bar{position:fixed;right:16px;bottom:16px;z-index:2147483647;background:#1f2937;color:#fff;' +
-      'font:13px/1.3 system-ui,sans-serif;padding:10px 12px;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.3);' +
-      'display:flex;gap:8px;align-items:center;flex-wrap:wrap;max-width:min(560px,calc(100vw - 32px))}' +
-      '#cse-export-bar button{background:#2563eb;color:#fff;border:0;border-radius:4px;padding:5px 10px;cursor:pointer;font:inherit}' +
-      '#cse-export-bar button:disabled{opacity:.5;cursor:default}' +
-      '#cse-export-bar input{font:inherit;padding:4px 6px;border-radius:4px;border:1px solid #4b5563}' +
-      '#cse-export-bar label{display:flex;gap:4px;align-items:center}' +
-      '#cse-export-status{flex-basis:100%;font-size:12px;opacity:.85}' +
-      '#cse-export-status:empty{display:none}' +
+      'html.cse-panel-open{margin-right:' + PANEL_WIDTH + 'px!important}' +
+      '#cse-panel{position:fixed;top:0;right:0;bottom:0;width:' + PANEL_WIDTH + 'px;z-index:2147483647;box-sizing:border-box;' +
+      'background:#111827;color:#e5e7eb;font:13px/1.4 system-ui,sans-serif;border-left:1px solid #374151;' +
+      'display:flex;flex-direction:column;box-shadow:-4px 0 16px rgba(0,0,0,.25)}' +
+      '#cse-panel *{box-sizing:border-box}' +
+      '#cse-panel.cse-collapsed{width:auto;bottom:auto;top:50%;transform:translateY(-50%);border-radius:6px 0 0 6px}' +
+      '#cse-panel.cse-collapsed .cse-body,#cse-panel.cse-collapsed .cse-title{display:none}' +
+      '#cse-panel .cse-head{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-bottom:1px solid #374151}' +
+      '#cse-panel.cse-collapsed .cse-head{border:0;padding:6px}' +
+      '#cse-panel .cse-title{font-weight:600;font-size:14px}' +
+      '#cse-panel .cse-body{flex:1;overflow:auto;padding:12px;display:flex;flex-direction:column;gap:14px}' +
+      '#cse-panel section{display:flex;flex-direction:column;gap:8px}' +
+      '#cse-panel h3{margin:0;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:#9ca3af;font-weight:600}' +
+      '#cse-panel .cse-row{display:flex;gap:6px;flex-wrap:wrap;align-items:center}' +
+      '#cse-panel button{background:#2563eb;color:#fff;border:0;border-radius:4px;padding:6px 10px;cursor:pointer;font:inherit}' +
+      '#cse-panel button:disabled{opacity:.4;cursor:default}' +
+      '#cse-panel button.cse-stop{background:#dc2626}' +
+      '#cse-panel button.cse-resume{background:#16a34a}' +
+      '#cse-panel button.cse-ghost{background:#374151}' +
+      '#cse-panel input,#cse-panel select{font:inherit;padding:4px 6px;border-radius:4px;border:1px solid #4b5563;background:#1f2937;color:#e5e7eb;width:100%}' +
+      '#cse-panel label{display:flex;flex-direction:column;gap:3px;font-size:12px;color:#9ca3af}' +
+      '#cse-panel dl{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin:0}' +
+      '#cse-panel dt{color:#9ca3af}#cse-panel dd{margin:0;font-variant-numeric:tabular-nums}' +
+      '#cse-job-state[data-state=running]{color:#60a5fa}#cse-job-state[data-state=paused]{color:#fbbf24}#cse-job-state[data-state=done]{color:#4ade80}' +
+      '#cse-job-current:empty,#cse-job-note:empty{display:none}' +
+      '#cse-job-note{color:#fbbf24;font-size:12px}' +
+      '#cse-job-log{list-style:none;margin:0;padding:6px 8px;max-height:220px;overflow:auto;background:#1f2937;border-radius:4px;font-size:12px}' +
+      '#cse-job-log:empty{display:none}#cse-job-log a{color:#93c5fd}' +
       'button.cse-export-row{background:#2563eb;color:#fff;border:0;border-radius:4px;padding:3px 8px;cursor:pointer;font:12px system-ui,sans-serif}';
     document.head.appendChild(style);
 
-    var bar = document.createElement('div');
-    bar.id = 'cse-export-bar';
-    bar.innerHTML =
-      '<span id="cse-export-count">0 Zeilen</span>' +
-      '<button type="button" data-f="csv">Seite CSV</button>' +
-      '<button type="button" data-f="json">Seite JSON</button>' +
-      '<button type="button" data-f="csv" data-pages="1">Alle Seiten CSV</button>' +
-      '<button type="button" data-f="json" data-pages="1">Alle Seiten JSON</button>' +
-      '<label>Max. Seiten <input id="cse-export-max" type="number" min="1" style="width:60px"></label>' +
-      '<label>Zeilen <input id="cse-export-sel" style="width:140px" title="CSS-Selektor für Zeilen"></label>' +
-      '<label>Weiter-Link <input id="cse-export-next" style="width:110px" placeholder="automatisch" title="CSS-Selektor für den Link zur nächsten Seite"></label>' +
-      '<span id="cse-export-status"></span>';
-    document.body.appendChild(bar);
+    var panel = document.createElement('div');
+    panel.id = 'cse-panel';
+    panel.innerHTML =
+      '<div class="cse-head"><span class="cse-title">Export</span>' +
+      '<button type="button" id="cse-toggle" class="cse-ghost" title="Ein-/Ausklappen">⇔</button></div>' +
+      '<div class="cse-body">' +
+      '<section><h3>Aktuelle Seite</h3>' +
+      '<div id="cse-page-count">0 Zeilen</div>' +
+      '<div class="cse-row"><button type="button" id="cse-page-csv">CSV</button><button type="button" id="cse-page-json">JSON</button></div></section>' +
+      '<section><h3>Export-Job (alle Seiten)</h3>' +
+      '<label>Format <select id="cse-format"><option value="csv">CSV</option><option value="json">JSON</option></select></label>' +
+      '<div class="cse-row">' +
+      '<button type="button" id="cse-start">Start</button>' +
+      '<button type="button" id="cse-stop" class="cse-stop" title="Anhalten und aktuellen Stand herunterladen">Stop</button>' +
+      '<button type="button" id="cse-resume" class="cse-resume">Weiter</button></div>' +
+      '<div class="cse-row"><button type="button" id="cse-download" class="cse-ghost">Download</button>' +
+      '<button type="button" id="cse-reset" class="cse-ghost">Neu</button></div>' +
+      '<dl><dt>Status</dt><dd id="cse-job-state">kein Job</dd>' +
+      '<dt>Seiten</dt><dd id="cse-job-pages">0</dd>' +
+      '<dt>Zeilen</dt><dd id="cse-job-rows">0</dd></dl>' +
+      '<div id="cse-job-current"></div>' +
+      '<div id="cse-job-note"></div>' +
+      '<ol id="cse-job-log"></ol></section>' +
+      '<section><h3>Einstellungen</h3>' +
+      '<label>Max. Seiten pro Lauf <input id="cse-max" type="number" min="1"></label>' +
+      '<label>Zeilen-Selektor <input id="cse-sel"></label>' +
+      '<label>Weiter-Link-Selektor <input id="cse-next" placeholder="automatisch"></label></section>' +
+      '</div>';
+    document.body.appendChild(panel);
 
-    var sel = bar.querySelector('#cse-export-sel');
+    $('cse-format').value = load('cseExportFormat', 'csv');
+    $('cse-format').addEventListener('change', function () { save('cseExportFormat', getFormat()); });
+
+    var sel = $('cse-sel');
     sel.value = getSelector();
     sel.addEventListener('change', function () {
       save('cseExportSelector', sel.value.trim() || DEFAULT_SELECTOR);
-      document.querySelectorAll('[' + MARK + ']').forEach(function (n) { n.remove(); });
+      document.querySelectorAll('[' + MARK + ']:not(iframe)').forEach(function (n) { n.remove(); });
       decorate();
     });
-    var next = bar.querySelector('#cse-export-next');
+    var next = $('cse-next');
     next.value = getNextSelector();
     next.addEventListener('change', function () { save('cseExportNext', next.value.trim()); });
-    var max = bar.querySelector('#cse-export-max');
+    var max = $('cse-max');
     max.value = getMaxPages();
     max.addEventListener('change', function () { save('cseExportMaxPages', String(parseInt(max.value, 10) || DEFAULT_MAX_PAGES)); });
 
-    bar.addEventListener('click', function (e) {
-      var f = e.target.getAttribute && e.target.getAttribute('data-f');
-      if (!f) return;
-      if (e.target.hasAttribute('data-pages')) exportPages(f);
-      else exportAll(f);
+    $('cse-toggle').addEventListener('click', function () { setCollapsed(!panel.classList.contains('cse-collapsed')); });
+    $('cse-page-csv').addEventListener('click', function () { exportAll('csv'); });
+    $('cse-page-json').addEventListener('click', function () { exportAll('json'); });
+    $('cse-start').addEventListener('click', startJob);
+    $('cse-stop').addEventListener('click', stopJob);
+    $('cse-resume').addEventListener('click', runJob);
+    $('cse-download').addEventListener('click', downloadJob);
+    $('cse-reset').addEventListener('click', resetJob);
+
+    window.addEventListener('beforeunload', function (e) {
+      if (job && job.state === 'running') { e.preventDefault(); e.returnValue = ''; }
     });
+
+    setCollapsed(load('cseExportCollapsed', '') === '1');
+    renderJob();
   }
 
   function init() {
-    buildBar();
+    buildPanel();
     decorate();
     // Results may be loaded or re-rendered by JavaScript.
     var pending = false;
